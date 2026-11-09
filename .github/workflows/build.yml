@@ -89,9 +89,22 @@ jobs:
               | sort
           )
 
+          # Adapt the embedded-data assembly for LLVM's WebAssembly assembler.
+          # Wasm rejects the ELF "a" flag and requires the data symbol size.
+          python3 - <<'PY_ASM'
+          from pathlib import Path
+          path = Path("src/data.S")
+          source = path.read_text()
+          old_block = """  .section .rodata.au_data,\"a\"\n  .balign 4\n  .global au_data\nau_data:\n  .incbin DATA_BIN\n  .balign 4"""
+          new_block = """  .section .rodata.au_data,\"\",@\n  .balign 4\n  .global au_data\nau_data:\n  .incbin DATA_BIN\n  .size au_data, .-au_data\n  .balign 4"""
+          if old_block not in source:
+              raise SystemExit("Impossible d'adapter src/data.S : bloc assembleur attendu introuvable")
+          path.write_text(source.replace(old_block, new_block, 1))
+          PY_ASM
+
           emcc "${GAME_SOURCES[@]}" src/plat_sdl.c src/main_web.c src/data.S \
             -std=gnu11 -O2 -Wall -Wextra -Wno-unused-parameter \
-            -fno-math-errno -fsingle-precision-constant \
+            -fno-math-errno \
             -Isrc -DHOST -DDATA_BIN='"src/data.bin"' \
             -sUSE_SDL=2 \
             -sALLOW_MEMORY_GROWTH=1 \
