@@ -1,0 +1,156 @@
+name: Build Among Us Windows (Web)
+
+on:
+  push:
+    branches:
+      - main
+      - master
+    paths:
+      - AmongUs-Windows.zip
+      - .github/workflows/build.yml
+  workflow_dispatch:
+
+permissions:
+  contents: read
+  pages: write
+  id-token: write
+
+concurrency:
+  group: among-us-pages
+  cancel-in-progress: true
+
+jobs:
+  build:
+    name: Extract and compile the game
+    runs-on: ubuntu-latest
+    container:
+      image: emscripten/emsdk:3.1.64
+
+    steps:
+      - name: Check out repository
+        uses: actions/checkout@v4
+
+      - name: Install archive utilities
+        shell: bash
+        run: |
+          apt-get update
+          apt-get install -y --no-install-recommends unzip zip python3
+
+      - name: Extract AmongUs-Windows.zip
+        id: locate
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          ZIP_FILE="AmongUs-Windows.zip"
+          if [ ! -f "$ZIP_FILE" ]; then
+            echo "::error::Le fichier AmongUs-Windows.zip est introuvable à la racine du dépôt."
+            exit 1
+          fi
+
+          mkdir -p extracted
+          unzip -q "$ZIP_FILE" -d extracted
+
+          # Find the actual game directory from its WebAssembly entry point.
+          MAIN_FILE="$(find extracted -type f -path '*/src/main_web.c' -print -quit)"
+          if [ -z "$MAIN_FILE" ]; then
+            echo "::error::src/main_web.c est introuvable dans AmongUs-Windows.zip."
+            echo "Vérifie que le ZIP contient bien les sources du jeu."
+            exit 1
+          fi
+
+          GAME_DIR="$(dirname "$(dirname "$MAIN_FILE")")"
+          for required in Makefile src/plat_sdl.c src/data.S src/data.bin web/shell.html web/README-WEB.md web/run-local.bat; do
+            if [ ! -f "$GAME_DIR/$required" ]; then
+              echo "::error::Fichier requis absent de l'archive : $required"
+              exit 1
+            fi
+          done
+
+          echo "GAME_DIR=$GAME_DIR" >> "$GITHUB_ENV"
+          echo "game_dir=$GAME_DIR" >> "$GITHUB_OUTPUT"
+          echo "Sources trouvées dans : $GAME_DIR"
+
+      - name: Compile the game to WebAssembly
+        shell: bash
+        run: |
+          set -euo pipefail
+          cd "$GAME_DIR"
+          mkdir -p build/web
+
+          # Compile the game sources once, using the SDL2 browser platform.
+          mapfile -t GAME_SOURCES < <(
+            find src -maxdepth 1 -type f -name '*.c' \
+              ! -name 'plat_eadk.c' \
+              ! -name 'plat_host.c' \
+              ! -name 'plat_sdl.c' \
+              ! -name 'main.c' \
+              ! -name 'main_web.c' \
+              | sort
+          )
+
+          emcc "${GAME_SOURCES[@]}" src/plat_sdl.c src/main_web.c src/data.S \
+            -std=gnu11 -O2 -Wall -Wextra -Wno-unused-parameter \
+            -fno-math-errno -fsingle-precision-constant \
+            -Isrc -DHOST -DDATA_BIN='"src/data.bin"' \
+            -sUSE_SDL=2 \
+            -sALLOW_MEMORY_GROWTH=1 \
+            -sINITIAL_MEMORY=67108864 \
+            -sMAXIMUM_MEMORY=536870912 \
+            -sSTACK_SIZE=8388608 \
+            -sFORCE_FILESYSTEM=1 \
+            -lidbfs.js \
+            -sEXIT_RUNTIME=0 \
+            --shell-file web/shell.html \
+            -o build/web/index.html
+
+          cp web/README-WEB.md build/web/README.txt
+          cp web/run-local.bat build/web/run-local.bat
+
+          # Fail early if Emscripten did not produce all expected runtime files.
+          for file in index.html index.js index.wasm; do
+            if [ ! -s "build/web/$file" ]; then
+              echo "::error::Fichier compilé manquant : build/web/$file"
+              exit 1
+            fi
+          done
+
+          # A ready-to-play ZIP is attached to the workflow run.
+          python3 - <<'PY'
+          from pathlib import Path
+          from zipfile import ZipFile, ZIP_DEFLATED
+
+          output = Path("build/web")
+          files = ["index.html", "index.js", "index.wasm", "README.txt", "run-local.bat"]
+          with ZipFile("build/web/AmongUs-Windows-Playable.zip", "w", ZIP_DEFLATED) as archive:
+              for name in files:
+                  path = output / name
+                  if not path.is_file() or path.stat().st_size == 0:
+                      raise SystemExit(f"Fichier manquant ou vide : {path}")
+                  archive.write(path, name)
+          PY
+
+      - name: Upload playable game ZIP
+        uses: actions/upload-artifact@v4
+        with:
+          name: AmongUs-Windows-Playable
+          path: ${{ steps.locate.outputs.game_dir }}/build/web/AmongUs-Windows-Playable.zip
+          if-no-files-found: error
+          retention-days: 30
+
+      - name: Upload website for GitHub Pages
+        uses: actions/upload-pages-artifact@v3
+        with:
+          path: ${{ steps.locate.outputs.game_dir }}/build/web
+
+  deploy:
+    name: Publish browser version on GitHub Pages
+    runs-on: ubuntu-latest
+    needs: build
+    environment:
+      name: github-pages
+      url: ${{ steps.deployment.outputs.page_url }}
+    steps:
+      - name: Deploy to GitHub Pages
+        id: deployment
+        uses: actions/deploy-pages@v4
